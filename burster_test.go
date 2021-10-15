@@ -2,6 +2,7 @@ package burstable_test
 
 import (
 	"math/rand"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -11,36 +12,42 @@ import (
 )
 
 type fakeController struct {
-	usage uint64
-	quota uint64
+	usage *uint64
+	quota *uint64
 	wait  time.Duration
 }
 
 // implements controller interface
 func (c *fakeController) GetCurrentPeriodUsage() uint64 {
-	return c.usage
+	return atomic.LoadUint64(c.usage)
 }
 
 func (c *fakeController) SetNextPriodQuota(quota uint64) {
-	c.quota = quota
+	atomic.StoreUint64(c.quota, quota)
+}
+
+func (c *fakeController) getQuota() uint64 {
+	return atomic.LoadUint64(c.quota)
 }
 
 func (c *fakeController) use(x uint64) {
-	c.usage = x
+	atomic.StoreUint64(c.usage, x)
 	time.Sleep(c.wait)
 }
 
 func TestBurster(t *testing.T) {
-	period := time.Millisecond * 10
+	period := time.Millisecond * 50
 	quota := uint64(1)
 	burst := uint64(2)
 	controller := &fakeController{
-		wait: period + time.Millisecond,
+		wait:  period + time.Millisecond*3,
+		usage: new(uint64),
+		quota: new(uint64),
 	}
 
 	burster := burstable.New(period, quota, burst, controller)
 	assert.Equal(t, uint64(0), burster.GetCredit())
-	assert.Equal(t, uint64(0), controller.quota)
+	assert.Equal(t, uint64(0), controller.getQuota())
 
 	go burster.Run()
 	defer burster.Stop()
@@ -48,27 +55,30 @@ func TestBurster(t *testing.T) {
 	// earn 1 credit
 	assert.Equal(t, uint64(1), burster.GetCredit())
 	// burst 1 credit
-	assert.Equal(t, quota+1, controller.quota)
+	assert.Equal(t, quota+1, controller.getQuota())
 	controller.use(quota)
 	// just hit quota, no credit earned
 	assert.Equal(t, uint64(1), burster.GetCredit())
-	assert.Equal(t, quota+1, controller.quota)
+	assert.Equal(t, quota+1, controller.getQuota())
 
 	controller.use(2)
 	// used all credit then back to original quota
 	assert.Equal(t, uint64(0), burster.GetCredit())
-	assert.Equal(t, quota, controller.quota)
+	assert.Equal(t, quota, controller.getQuota())
 
 	// idle for (burst+1) periods, earned (burst+1) credit but only can burst to quota + burst
 	for i := uint64(0); i <= burst; i++ {
 		controller.use(0)
 	}
-	assert.Equal(t, quota+burst, controller.quota)
+	assert.Equal(t, quota+burst, controller.getQuota())
 	assert.Equal(t, burst+1, burster.GetCredit())
 	// up to limit
 	controller.use(quota + burst)
 	assert.Equal(t, uint64(1), burster.GetCredit())
-	assert.Equal(t, quota+1, controller.quota)
+	assert.Equal(t, quota+1, controller.getQuota())
+
+	// already started
+	assert.Panics(t, burster.Run)
 }
 
 func TestEffectOfBurster(t *testing.T) {
@@ -98,8 +108,8 @@ func TestEffectOfBurster(t *testing.T) {
 		},
 		{
 			Name:  "fixed4",
-			usage: []uint64{1, 2, 3, 0, 3, 2, 1},
-			quota: 3,
+			usage: []uint64{1, 5, 3, 2, 3, 7, 1},
+			quota: 4,
 			burst: 3,
 		},
 		{
@@ -110,8 +120,8 @@ func TestEffectOfBurster(t *testing.T) {
 		},
 		{
 			Name:  "random2",
-			usage: randomUsage(10, 10),
-			quota: 4,
+			usage: randomUsage(100, 30),
+			quota: 5,
 			burst: 3,
 		},
 	} {

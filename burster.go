@@ -1,15 +1,19 @@
 package burstable
 
 import (
-	"sync/atomic"
+	"math"
+	"sync"
 	"time"
 )
 
 var _ Burster = new(burster)
 
 type burster struct {
-	credit *uint64
-	stopCh chan struct{}
+	lock       sync.RWMutex
+	credit     uint64
+	stopCh     chan struct{}
+	creditCeil uint64
+	started    bool
 	// settings
 	period     time.Duration
 	quota      uint64
@@ -19,8 +23,9 @@ type burster struct {
 
 func New(period time.Duration, quota uint64, burst uint64, controller Controller) *burster {
 	b := &burster{
-		credit:     new(uint64),
+		credit:     0,
 		stopCh:     make(chan struct{}),
+		creditCeil: math.MaxUint64 - quota,
 		period:     period,
 		quota:      quota,
 		burst:      burst,
@@ -30,6 +35,10 @@ func New(period time.Duration, quota uint64, burst uint64, controller Controller
 }
 
 func (b *burster) Run() {
+	if b.started {
+		panic("Burster already started")
+	}
+	b.started = true
 	// Initialize
 	b.controller.SetNextPriodQuota(b.quota)
 	timer := time.NewTicker(b.period)
@@ -40,6 +49,8 @@ func (b *burster) Run() {
 		case <-timer.C:
 			// Get previoud period usage stat
 			used := b.controller.GetCurrentPeriodUsage()
+			b.lock.Lock()
+			credit := b.credit
 			if used > b.quota {
 				// indicates use burst in this period, should take out from credit
 				overrun := used - b.quota
@@ -47,15 +58,22 @@ func (b *burster) Run() {
 					overrun = b.burst
 				}
 				// if more than credit
-				if credit := atomic.LoadUint64(b.credit); overrun > credit {
-					atomic.StoreUint64(b.credit, 0)
+				if overrun > credit {
+					credit = 0
 				} else {
-					atomic.AddUint64(b.credit, ^uint64(overrun-1))
+					credit -= overrun
 				}
 			} else {
-				atomic.AddUint64(b.credit, b.quota-used)
+				// earn credit
+				credit += b.quota - used
+				if credit > b.creditCeil {
+					credit = b.creditCeil
+				}
 			}
-			nextBurst := atomic.LoadUint64(b.credit)
+			b.credit = credit
+			nextBurst := credit
+			b.lock.Unlock()
+
 			if nextBurst > b.burst {
 				nextBurst = b.burst
 			}
@@ -65,7 +83,9 @@ func (b *burster) Run() {
 }
 
 func (b *burster) GetCredit() uint64 {
-	return atomic.LoadUint64(b.credit)
+	b.lock.RLock()
+	defer b.lock.RUnlock()
+	return b.credit
 }
 
 func (b *burster) Stop() {
