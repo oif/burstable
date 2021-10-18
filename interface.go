@@ -2,6 +2,7 @@ package burstable
 
 type Burster interface {
 	Run()
+	Stop()
 }
 
 type Controller interface {
